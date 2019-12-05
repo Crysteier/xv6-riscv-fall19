@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -195,6 +197,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
     }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+      
     if(do_free){
       pa = PTE2PA(*pte);
       kfree((void*)pa);
@@ -322,15 +325,25 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
+    // printf("ALOKOVAL SOM STRANKU %d\n", i);
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+    //je nastaveny PTE_W u rodica?
+    if(*pte & PTE_W) { //nastavujem write bit.. je nastaveny PTE_W u rodica?
+      //odstran PTE_W u rodica
+      *pte ^= PTE_W; //xor operacia (PTE_W je nastaveny na 1 a ked ho zoxorujem tak sa stane nulou)
+      // musim dodefinovat PTE_COW v riscv.h - to je jednotka posunuta o 8 alebo 9 bitov (ani jeden z nich este nie je used)
+      //a teraz to mozem pouzit: odstranim kandidata na PTE_COW
+      *pte |= PTE_COW;
+    }
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
+
+    /*
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
@@ -338,12 +351,66 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       kfree(mem);
       goto err;
     }
+    */
+   if(mappages(new, i, PGSIZE, pa, flags) != 0) {
+     goto err;
+   }
+   inc_ref(pa);
   }
   return 0;
 
  err:
   uvmunmap(new, 0, i, 1);
   return -1;
+}
+
+int
+uvmcow(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  char *mem;
+  uint64 pa;
+  uint flags;
+  struct proc *p = myproc();
+  if(va >= p->sz)
+    return -5;
+  // SKUSIME ZAOKRUHLIT
+  va = PGROUNDDOWN(va);
+  //existuje zaznam v PT?
+  if((pte = walk(pagetable, va, 0)) == 0) {
+    panic("uvmcow: pte should exist");
+  }
+  //je zaznam v PT platny?
+  if((*pte & PTE_V) == 0) {
+    panic("uvmcow: page not present");
+  }
+  //jedna sa o COW?
+  if((*pte & PTE_COW) == 0) {
+    // printf("uvmcow: PTE_COW not set for 0x%p\n",va);
+    return -2; //vraciam zapornu hodnotu lebo v trap.c ked sa to zavola tak zabije proces
+  }
+
+  //spravime alokaciu pamate: alokuj jednu stranku v ramke
+  if((mem = kalloc()) == 0) {
+    printf("uvmcow: kalloc failed\n");
+    return -3; //to iste
+  }
+
+  //presunutie (kopirovanie udajov): skopiruj povodne data v ramke do novej stranky
+  pa = PTE2PA(*pte); //ziskam fyz adresu
+  memmove(mem,(char*)pa, PGSIZE);
+
+  flags = PTE_FLAGS(*pte);
+  flags ^= PTE_COW; //zrusim priznak
+  flags |= PTE_W;
+  //predtym nez namapujem, musim odmapovat
+  uvmunmap(pagetable, PGROUNDDOWN(va), PGSIZE, 1);
+  if(mappages(pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0){ //ak nam to zlyha, tak
+    printf("uvmcow: mappages failed\n");
+    //alokovali sme ramku, tak ju uvolnime (teda ak to zlyha, co prave riesime taky pripad)
+    kfree(mem);
+    return -4;
+  }
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -369,6 +436,12 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+    if (va0 >= MAXVA)
+      return -1;
+    pte_t *pte = walk(pagetable, va0, 0);
+    if (*pte & PTE_COW)
+      if (uvmcow(pagetable, va0))
+        panic("copyout panic");
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -376,7 +449,6 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(n > len)
       n = len;
     memmove((void *)(pa0 + (dstva - va0)), src, n);
-
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
