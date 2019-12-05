@@ -239,7 +239,7 @@ bad:
 }
 
 static struct inode*
-create(char *path, short type, short major, short minor)
+create(char *path, short type, short major, short minor, char *target)
 {
   struct inode *ip, *dp;
   char name[DIRSIZ];
@@ -273,6 +273,9 @@ create(char *path, short type, short major, short minor)
     // No ip->nlink++ for ".": avoid cyclic ref count.
     if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
       panic("create dots");
+  } else if (type == T_SYMLINK) {
+    if(writei(ip, 0, (uint64)target, 0, strlen(target)) != strlen(target))
+      panic("panic: create symlink");
   }
 
   if(dirlink(dp, name, ip->inum) < 0)
@@ -290,7 +293,7 @@ sys_open(void)
   int fd, omode;
   struct file *f;
   struct inode *ip;
-  int n;
+  int n, symlink_recursion = 0;
 
   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
     return -1;
@@ -298,12 +301,13 @@ sys_open(void)
   begin_op(ROOTDEV);
 
   if(omode & O_CREATE){
-    ip = create(path, T_FILE, 0, 0);
+    ip = create(path, T_FILE, 0, 0, 0);
     if(ip == 0){
       end_op(ROOTDEV);
       return -1;
     }
   } else {
+open_symlink:
     if((ip = namei(path)) == 0){
       end_op(ROOTDEV);
       return -1;
@@ -320,6 +324,19 @@ sys_open(void)
     iunlockput(ip);
     end_op(ROOTDEV);
     return -1;
+  }
+
+  if (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+    if (symlink_recursion > 10) {
+      iunlockput(ip);
+      end_op(ROOTDEV);
+      return -1;
+    }
+    if(readi(ip, 0, (uint64)&path, 0, MAXPATH) <= 0)
+      panic("sys_open: symlink readi");
+    iunlockput(ip);
+    symlink_recursion++;
+    goto open_symlink;
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
@@ -355,7 +372,7 @@ sys_mkdir(void)
   struct inode *ip;
 
   begin_op(ROOTDEV);
-  if(argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
+  if(argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0, 0)) == 0){
     end_op(ROOTDEV);
     return -1;
   }
@@ -375,7 +392,7 @@ sys_mknod(void)
   if((argstr(0, path, MAXPATH)) < 0 ||
      argint(1, &major) < 0 ||
      argint(2, &minor) < 0 ||
-     (ip = create(path, T_DEVICE, major, minor)) == 0){
+     (ip = create(path, T_DEVICE, major, minor, 0)) == 0){
     end_op(ROOTDEV);
     return -1;
   }
@@ -483,3 +500,34 @@ sys_pipe(void)
   return 0;
 }
 
+uint64
+sys_symlink(void) {
+  char name[MAXPATH], target[MAXPATH], path[MAXPATH];
+  struct inode *dp, *ip;
+  
+  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0){
+    return -1;
+  }
+  begin_op(ROOTDEV);
+  // dp je inode priecinku
+  if((dp = nameiparent(path, name)) == 0)
+    goto bad;
+  // nachadza sa subor na inode?
+  ilock(dp);
+  if((ip = dirlookup(dp, name, 0)) != 0) {
+    iunlockput(dp);  
+    goto bad;
+  }
+  // viem, ze dana cesta neexistuje, treba ju uz "iba" vytvorit
+  iunlockput(dp);
+  
+  if ((ip = create(path, T_SYMLINK, 0, 0, target)) == 0)
+    goto bad;
+  iunlockput(ip);
+  // ukoncenie operacie logu
+  end_op(ROOTDEV);
+  return 0;
+bad:
+  end_op(ROOTDEV);
+  return -1;
+}
