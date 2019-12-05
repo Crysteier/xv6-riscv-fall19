@@ -109,7 +109,7 @@ walkaddr(pagetable_t pagetable, uint64 va)
 
   pte = walk(pagetable, va, 0);
   if(pte == 0)
-    return 0;
+    return 0; // TODO
   if((*pte & PTE_V) == 0)
     return 0;
   if((*pte & PTE_U) == 0)
@@ -188,10 +188,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
   last = PGROUNDDOWN(va + size - 1);
   for(;;){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
+      goto next;
     if((*pte & PTE_V) == 0){
-      printf("va=%p pte=%p\n", a, *pte);
-      panic("uvmunmap: not mapped");
+      goto next;
     }
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
@@ -200,6 +199,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 size, int do_free)
       kfree((void*)pa);
     }
     *pte = 0;
+    next:
     if(a == last)
       break;
     a += PGSIZE;
@@ -326,9 +326,9 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
+      continue;
     if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+      continue;
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
     if((mem = kalloc()) == 0)
@@ -450,4 +450,52 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+static void
+tablewalk(pagetable_t pagetable, int level)
+{
+// there are 2^9 = 512 PTEs in a page table.
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      for (int j = 0; j < level; j++) {
+        printf(" ..");
+      }
+      printf("%d: pte %p pa %p\n", i, pte, child);
+      tablewalk((pagetable_t)child, level + 1);
+    } else if(pte & PTE_V) {
+      // leaf
+      for (int j = 0; j < level ; j++)
+        printf(" ..");
+      printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+    }
+  }
+}
+
+void
+vmprint(pagetable_t pagetable)
+{
+  printf("page table: %p\n", pagetable);
+  tablewalk(pagetable, 0);
+}
+
+uint64
+my_uvmalloc(pagetable_t pagetable, uint64 sz)
+{
+  char *mem;
+  sz = PGROUNDDOWN(sz);
+  mem = kalloc();
+  if(mem == 0){
+    return -1;
+  }
+  memset(mem, 0, PGSIZE);
+  if(mappages(pagetable, sz, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_U|PTE_X) != 0){
+    kfree(mem);
+    uvmdealloc(pagetable, sz, sz);
+    return 0;
+  }
+  return sz;
 }
