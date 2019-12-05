@@ -7,8 +7,6 @@ struct buf {
   uint refcnt;
   struct buf *prev; // LRU cache list
   struct buf *next;
-  uint timestamp;
-  struct spinlock reflock; 
   uchar data[BSIZE];
 };
 
