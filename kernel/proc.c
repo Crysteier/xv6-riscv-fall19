@@ -123,6 +123,10 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  p->ticks = 0;
+  p->start_time = 0;
+  p->handler = (void (*)())MAXVA;
+
   return p;
 }
 
